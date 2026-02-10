@@ -9,6 +9,7 @@ import { CategorySelector } from "../components/CategorySelector";
 import { LoadingAnimation } from "../components/LoadingAnimation";
 import { useRecentStickers } from "../context/RecentStickersContext";
 import {
+  downloadReplicateOutput,
   generateImageFromPrompt,
   generateStickerFromPhoto,
   hasReplicateToken,
@@ -22,6 +23,15 @@ import * as Haptics from "expo-haptics";
 import type { RootStackParamList } from "../types/navigation";
 
 type GeneratorNav = NativeStackNavigationProp<RootStackParamList, "Generator">;
+
+/** Turn a result URL (file, replicate.delivery, or other http) into a local file path for preview/share. */
+async function resultUrlToLocalPath(resultUrl: string): Promise<string> {
+  if (resultUrl.startsWith("file://")) return resultUrl;
+  if (resultUrl.includes("replicate.delivery")) {
+    return downloadReplicateOutput(resultUrl);
+  }
+  return saveStickerLocally(resultUrl);
+}
 
 function GeneratorScreenInner() {
   const navigation = useNavigation<GeneratorNav>();
@@ -80,23 +90,27 @@ function GeneratorScreenInner() {
     if (photoUri) {
       setLoading(true);
       try {
-        // One sticker per photo: remove background (crop to subject, no background) then AI + prompt
-        let imageForSticker: string;
-        if (useReplicate) {
-          const prepared = await prepareImageForReplicate(photoUri);
-          try {
-            imageForSticker = await removeBackground(prepared);
-          } catch {
-            imageForSticker = prepared;
-          }
+        // 1) Prepare photo (crop/resize for API)
+        const prepared = await prepareImageForReplicate(photoUri);
+
+        // 2) Apply AI style first (full photo → styled image)
+        let resultUrl: string;
+        if (useGrok) {
+          resultUrl = await generateStickerWithGrok(prepared, trimmed);
         } else {
-          imageForSticker = await prepareImageForReplicate(photoUri);
+          resultUrl = await generateStickerFromPhoto(prepared, trimmed);
         }
-        const resultUrl =
-          useGrok
-            ? await generateStickerWithGrok(imageForSticker, trimmed)
-            : await generateStickerFromPhoto(imageForSticker, trimmed);
-        const downloaded = await saveStickerLocally(resultUrl);
+
+        // 3) Remove background from styled result → sticker is subject only
+        if (resultUrl.startsWith("http")) {
+          try {
+            resultUrl = await removeBackground(resultUrl);
+          } catch {
+            // keep styled image if bg removal fails
+          }
+        }
+
+        const downloaded = await resultUrlToLocalPath(resultUrl);
         const localUri = await resizeToStickerSize(downloaded);
         await addSticker(localUri);
         setLoading(false);
@@ -113,7 +127,7 @@ function GeneratorScreenInner() {
       setLoading(true);
       try {
         const resultUrl = await generateImageFromPrompt(trimmed);
-        const downloaded = await saveStickerLocally(resultUrl);
+        const downloaded = await resultUrlToLocalPath(resultUrl);
         const localUri = await resizeToStickerSize(downloaded);
         await addSticker(localUri);
         setLoading(false);

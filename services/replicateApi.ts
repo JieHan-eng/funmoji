@@ -1,11 +1,23 @@
 /**
  * Replicate API client: FLUX text-to-image (prompt → sticker) and optional face-to-sticker.
  * Requires REPLICATE_API_TOKEN in environment or .env.
+ *
+ * Mock mode (no API calls, no credits): set EXPO_PUBLIC_REPLICATE_MOCK=true in .env
+ * to test the full flow using local sticker generation instead of Replicate.
  */
 
 import * as FileSystem from "expo-file-system/legacy";
+import { createStickerLocally } from "../utils/createStickerLocally";
+
+/** When true, all Replicate calls are faked locally – no API usage, no credits. */
+const REPLICATE_MOCK =
+  process.env.EXPO_PUBLIC_REPLICATE_MOCK === "true" ||
+  process.env.EXPO_PUBLIC_REPLICATE_MOCK === "1";
 
 const REPLICATE_API_URL = "https://api.replicate.com/v1/predictions";
+/** Placeholder image for mock text-to-image (no download cost). */
+const MOCK_PLACEHOLDER_IMAGE =
+  "https://placehold.co/512x512/7c3aed/white?text=Mock";
 /** FLUX.1 [schnell] – fast, cheap (~$0.003/img), great for prompt → sticker */
 const FLUX_SCHNELL_VERSION =
   "black-forest-labs/flux-schnell:bf53bdb93d739c9c915091cfa5f49ca662d11273a5eb30e7a2ec1939bcf27a00";
@@ -58,6 +70,7 @@ function getApiToken(): string {
 
 /** Call before starting generation to show a clear message if token is missing. */
 export function hasReplicateToken(): boolean {
+  if (REPLICATE_MOCK) return true;
   return !!(
     process.env.EXPO_PUBLIC_REPLICATE_API_TOKEN ||
     process.env.REPLICATE_API_TOKEN
@@ -118,6 +131,17 @@ export async function detectAndCropFace(imageUriOrDataUrl: string): Promise<stri
 export async function detectAndCropAllFaces(
   imageUriOrDataUrl: string
 ): Promise<string[]> {
+  if (REPLICATE_MOCK) {
+    if (imageUriOrDataUrl.startsWith("file://")) {
+      try {
+        const uri = await createStickerLocally(imageUriOrDataUrl);
+        return [uri];
+      } catch {
+        return [];
+      }
+    }
+    return [imageUriOrDataUrl];
+  }
   try {
     const imageInput =
       imageUriOrDataUrl.startsWith("http") || imageUriOrDataUrl.startsWith("data:")
@@ -138,6 +162,7 @@ export async function detectAndCropAllFaces(
  * Use before sending to sticker AI so the prompt customizes the isolated subject.
  */
 export async function removeBackground(imageUriOrDataUrl: string): Promise<string> {
+  if (REPLICATE_MOCK) return imageUriOrDataUrl;
   const imageInput =
     imageUriOrDataUrl.startsWith("http") || imageUriOrDataUrl.startsWith("data:")
       ? imageUriOrDataUrl
@@ -153,9 +178,15 @@ export async function removeBackground(imageUriOrDataUrl: string): Promise<strin
  */
 export async function createPrediction(
   imageUrl: string,
-  style: StickerStyle
+  _style: StickerStyle
 ): Promise<string> {
-  const prompt = STYLE_PROMPTS[style];
+  if (REPLICATE_MOCK) {
+    if (imageUrl.startsWith("file://")) {
+      return createStickerLocally(imageUrl);
+    }
+    return MOCK_PLACEHOLDER_IMAGE;
+  }
+  const prompt = STYLE_PROMPTS[_style];
   const id = await createPredictionRequest(FACE_TO_STICKER_VERSION, {
     image: imageUrl,
     prompt,
@@ -176,15 +207,21 @@ export async function createPrediction(
  */
 export async function generateStickerFromPhoto(
   imageUri: string,
-  prompt: string
+  _prompt: string
 ): Promise<string> {
+  if (REPLICATE_MOCK) {
+    if (!imageUri.startsWith("file://")) {
+      throw new Error("Mock mode: use a photo from your device (camera or gallery).");
+    }
+    return createStickerLocally(imageUri);
+  }
   const imageUrl =
     imageUri.startsWith("http") || imageUri.startsWith("data:")
       ? imageUri
       : await localUriToDataUrl(imageUri);
   const id = await createPredictionRequest(FACE_TO_STICKER_VERSION, {
     image: imageUrl,
-    prompt: prompt.trim(),
+    prompt: _prompt.trim(),
     instant_id_strength: 1,
     ip_adapter_weight: 0.2,
     ip_adapter_noise: 0.5,
@@ -196,22 +233,74 @@ export async function generateStickerFromPhoto(
   return getPredictionResult(id);
 }
 
+const HTTP_URL = /^https?:\/\//i;
+const DATA_URI = /^data:/i;
+const REPLICATE_DELIVERY = /^(https?:\/\/)?(replicate\.delivery\/)/i;
+
+/** Normalize Replicate output URL (e.g. "replicate.delivery/pb/..." -> "https://replicate.delivery/..."). */
+function normalizeOutputUrl(s: string): string {
+  const t = s.trim();
+  if (REPLICATE_DELIVERY.test(t) && !HTTP_URL.test(t)) return `https://${t.replace(/^https?:\/\//i, "")}`;
+  return t;
+}
+
+function isUrl(s: string): boolean {
+  const t = typeof s === "string" ? s.trim() : "";
+  if (t.length < 10) return false;
+  if (HTTP_URL.test(t) || DATA_URI.test(t)) return true;
+  if (REPLICATE_DELIVERY.test(t)) return true;
+  return false;
+}
+
+function extractUrlsFrom(value: unknown): string[] {
+  const urls: string[] = [];
+  if (typeof value === "string") {
+    const t = value.trim();
+    if (isUrl(t)) urls.push(normalizeOutputUrl(t));
+    return urls;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      urls.push(...extractUrlsFrom(item));
+    }
+    return urls;
+  }
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    for (const key of ["url", "uri", "href", "image", "output", "result", "file"]) {
+      if (key in obj && typeof obj[key] === "string" && isUrl(obj[key] as string)) {
+        urls.push(normalizeOutputUrl((obj[key] as string).trim()));
+      }
+    }
+    for (const v of Object.values(obj)) {
+      urls.push(...extractUrlsFrom(v));
+    }
+  }
+  return urls;
+}
+
 /**
  * Normalize Replicate output to an array of URLs (for multi-face or single).
+ * Handles nested objects, arrays, and various key names (url, uri, href, image, output, result, file).
  */
 function outputToUrls(out: unknown): string[] {
-  if (Array.isArray(out)) {
-    return out
-      .map((item) => {
-        if (typeof item === "string") return item;
-        if (item && typeof item === "object" && "url" in item) return (item as { url: string }).url;
-        return null;
-      })
-      .filter((u): u is string => !!u);
+  const list = extractUrlsFrom(out).filter((u): u is string => typeof u === "string" && isUrl(u));
+  return [...new Set(list)];
+}
+
+function describeOutput(out: unknown): string {
+  if (out == null) return "Output was empty.";
+  if (typeof out === "string") {
+    const t = out.trim();
+    if (t.length > 80) return `Output was a long string (${t.length} chars), not a URL.`;
+    return `Output was: "${t.slice(0, 60)}${t.length > 60 ? "…" : ""}".`;
   }
-  if (typeof out === "string") return [out];
-  if (out && typeof out === "object" && "url" in out) return [(out as { url: string }).url];
-  return [];
+  if (Array.isArray(out)) return `Output was an array of ${out.length} item(s).`;
+  if (typeof out === "object") {
+    const keys = Object.keys(out as object).slice(0, 8);
+    return `Output was an object with keys: ${keys.join(", ") || "none"}.`;
+  }
+  return `Output type: ${typeof out}.`;
 }
 
 /**
@@ -231,7 +320,18 @@ export async function getPredictionResultAll(
     const data = (await res.json()) as ReplicatePrediction;
 
     if (data.status === "succeeded") {
-      return outputToUrls(data.output);
+      const raw = data.output ?? (data as Record<string, unknown>).outputs ?? (data as Record<string, unknown>).result;
+      if (raw == null) {
+        throw new Error(
+          "Replicate returned no image URL (output was empty). Try again with a new photo or use a clearer face shot."
+        );
+      }
+      const urls = outputToUrls(raw);
+      if (urls.length > 0) return urls;
+      const hint = describeOutput(raw);
+      throw new Error(
+        `Replicate returned no image URL. ${hint} Try another photo or check the model at replicate.com/fofr/face-to-sticker.`
+      );
     }
     if (data.status === "failed") {
       throw new Error(data.error || "Prediction failed");
@@ -250,7 +350,11 @@ export async function getPredictionResult(
   predictionId: string
 ): Promise<string> {
   const urls = await getPredictionResultAll(predictionId);
-  if (urls.length === 0) throw new Error("Unexpected output format from Replicate");
+  if (urls.length === 0) {
+    throw new Error(
+      "Replicate returned no image URL. Try another photo or check replicate.com/fofr/face-to-sticker for the model output format."
+    );
+  }
   return urls[0];
 }
 
@@ -267,11 +371,48 @@ async function localUriToDataUrl(uri: string): Promise<string> {
 }
 
 /**
+ * Download image from Replicate output URL (replicate.delivery) with auth.
+ * Use when saveStickerLocally would fail due to missing Authorization header.
+ * Returns local file URI.
+ */
+export async function downloadReplicateOutput(remoteUrl: string): Promise<string> {
+  if (!remoteUrl || !remoteUrl.startsWith("http")) {
+    throw new Error("Invalid Replicate output URL.");
+  }
+  const token = getApiToken();
+  const res = await fetch(remoteUrl, {
+    headers: { Authorization: `Token ${token}` },
+  });
+  if (!res.ok) throw new Error(`Could not download sticker: ${res.status}`);
+  const blob = await res.blob();
+  const dir = FileSystem.cacheDirectory ?? `${FileSystem.documentDirectory}stickers/`;
+  await FileSystem.makeDirAsync(dir, { intermediates: true });
+  const localUri = `${dir}funmoji_${Date.now()}.png`;
+  const reader = new FileReader();
+  const base64 = await new Promise<string>((resolve, reject) => {
+    reader.onloadend = () => {
+      const result = reader.result;
+      if (typeof result === "string") {
+        const b64 = result.split(",")[1] ?? result;
+        resolve(b64);
+      } else reject(new Error("Could not read blob"));
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+  await FileSystem.writeAsStringAsync(localUri, base64, {
+    encoding: "base64",
+  });
+  return localUri;
+}
+
+/**
  * Generate an image from a text prompt using FLUX.1 [schnell].
  * Best for "fun stickers from prompts" – no photo needed. ~$0.003/image.
  * Returns the generated image URL.
  */
 export async function generateImageFromPrompt(prompt: string): Promise<string> {
+  if (REPLICATE_MOCK) return MOCK_PLACEHOLDER_IMAGE;
   const id = await createPredictionRequest(FLUX_SCHNELL_VERSION, {
     prompt: prompt.trim(),
     aspect_ratio: "1:1",
@@ -287,12 +428,18 @@ export async function generateImageFromPrompt(prompt: string): Promise<string> {
  */
 export async function generateSticker(
   imageUri: string,
-  style: StickerStyle
+  _style: StickerStyle
 ): Promise<string> {
+  if (REPLICATE_MOCK) {
+    if (!imageUri.startsWith("file://")) {
+      throw new Error("Mock mode: use a photo from your device (camera or gallery).");
+    }
+    return createStickerLocally(imageUri);
+  }
   const imageUrl = imageUri.startsWith("http")
     ? imageUri
     : await localUriToDataUrl(imageUri);
-  const id = await createPrediction(imageUrl, style);
+  const id = await createPrediction(imageUrl, _style);
   return getPredictionResult(id);
 }
 
