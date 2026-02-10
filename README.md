@@ -1,60 +1,58 @@
 # FunMoji
 
-Turn selfies into AI stickers for WhatsApp and Telegram. Built with React Native (Expo), NativeWind, and Replicate's **fofr/face-to-sticker** model (InstantID).
+Create fun stickers from **your own prompts** and share them to WhatsApp and Telegram. Describe what you want (e.g. “a cute cat in a wizard hat”, “anime dragon”) and the app generates a sticker with AI.
 
 ## Stack
 
 - **Framework:** React Native + Expo (Managed, SDK 54)
 - **UI:** NativeWind (Tailwind) + Lucide React Native
-- **AI:** Replicate API (`fofr/face-to-sticker`)
+- **AI:** Replicate (FLUX.1 [schnell]) – text-to-image, ~$0.003 per sticker
+- **Optional:** xAI Grok – turn your photo + prompt into a sticker
 - **Images:** expo-image-picker, expo-sharing, expo-image-manipulator, expo-haptics
 
 ## Setup
 
-1. **Install dependencies** (already done if you cloned):
+1. **Install dependencies**
 
    ```bash
    cd funmoji && npm install
    ```
 
-2. **Replicate API token**
+2. **API key for prompt-based generation**
 
-   - Get a token at [Replicate Account → API tokens](https://replicate.com/account/api-tokens).
-   - Create a `.env` in the project root (see `.env.example`):
+   Copy `.env.example` to `.env` and set **`EXPO_PUBLIC_REPLICATE_API_TOKEN`** (get a token at [replicate.com/account/api-tokens](https://replicate.com/account/api-tokens)). The app uses **FLUX.1 [schnell]** on Replicate to generate images from your text prompt (~$0.003 per image).
 
-   ```
-   EXPO_PUBLIC_REPLICATE_API_TOKEN=your_token_here
-   ```
+   **Optional:** Set **`EXPO_PUBLIC_XAI_API_KEY`** (from [console.x.ai](https://console.x.ai)) to enable “Add photo” in the Generator – we’ll turn your face + prompt into a sticker with Grok.
 
-   Expo will expose `EXPO_PUBLIC_*` to the app at runtime.
-
-3. **Run the app**
+3. **Start the dev server**
 
    ```bash
    npx expo start
    ```
 
-   Then open in iOS Simulator, Android emulator, or Expo Go.
-
-## Project structure
-
-- **`/screens`** – Home, Generator (camera/picker + style grid), Preview
-- **`/components`** – StickerCard, StyleSelector, LoadingAnimation
-- **`/services`** – `replicateApi.ts` (Replicate predictions + InstantID params)
-- **`/utils`** – `stickerFormatter.ts` (512×512 resize, PNG/export for WhatsApp & Telegram)
-- **`/types`** – Navigation param types
+   - **Recommended:** Use **Expo Go** on your phone and scan the QR code.
+   - **Web:** Press `w` in the terminal (camera/photo may differ in browser).
 
 ## App flow
 
-1. **Home** – Dark dashboard with “Create New Sticker” and horizontal “My Recent Stickers”.
-2. **Generator** – Take photo or choose from library → pick style (Anime, 3D Pixar, Comic, Pop Art) → Generate (calls Replicate).
-3. **Preview** – Result with thick white border; “Add to WhatsApp” and “Add to Telegram” (resize to 512×512, then share). Haptic feedback on success.
+1. **Home** – “Create New Sticker” and “My Recent Stickers”.
+2. **Generator** – **Describe your sticker** in the text box (e.g. “cute cat in a hat”, “anime style dragon”). Use the style presets to fill the prompt, or type your own. If you have a Replicate token, tap **Generate Sticker** – we generate with FLUX and show the result. If you also set a Grok key, you can optionally add a photo to turn your face into that sticker style.
+3. **Preview** – View the sticker, then **Add to WhatsApp** or **Add to Telegram** (resize to 512×512 and share). Haptic feedback on success.
 
 ## Sticker logic
 
-- Before export: resize to **512×512** and save as PNG (expo-image-manipulator). WhatsApp and Telegram both accept PNG for stickers.
-- Identity: Replicate input uses **InstantID** params (`instant_id_strength: 1`, `ip_adapter_weight: 0.2`) so the sticker resembles the user.
+- **From prompt only (Replicate):** Your description is sent to FLUX.1 [schnell]; the image is downloaded, resized to 512×512, and shown. Export to WhatsApp/Telegram as PNG.
+- **From photo + prompt (Grok, optional):** Photo is cropped and sent to xAI with your prompt; result is saved and resized to 512×512.
+- All stickers are resized to **512×512** PNG for WhatsApp and Telegram.
+
+## Project structure
+
+- **`/screens`** – Home, Generator (prompt + optional photo), Preview
+- **`/components`** – StickerCard, CategorySelector (prompt categories), LoadingAnimation
+- **`/constants`** – promptCategories (styles for photo, ideas for text-only)
+- **`/services`** – `replicateApi.ts` (FLUX text-to-image + face-to-sticker), `grokApi.ts` (xAI image edit)
+- **`/utils`** – stickerFormatter, imagePrep, saveStickerLocally
 
 ## Theme
 
-Dark “vibey” aesthetic: deep purples (`#0f0618`, `#1a0a2e`), accent `#a855f7`, neon `#c084fc`.
+Dark purple aesthetic: deep purples (`#0f0618`, `#1a0a2e`), accent `#a855f7`, neon `#c084fc`.

@@ -3,7 +3,7 @@
  */
 
 import * as ImageManipulator from "expo-image-manipulator";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 
 const STICKER_SIZE = 512;
 

@@ -1,4 +1,4 @@
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 
 /**
  * Download a sticker image from a URL (e.g. Replicate output) and save to local storage.

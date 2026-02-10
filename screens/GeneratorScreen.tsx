@@ -1,17 +1,24 @@
 import React, { memo, useState } from "react";
-import { View, Text, Image, Pressable, Alert } from "react-native";
+import { View, Text, Image, Pressable, Alert, ScrollView, TextInput } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useNavigation } from "@react-navigation/native";
 import type { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import * as ImagePicker from "expo-image-picker";
 import { Camera, ImagePlus, Sparkles } from "lucide-react-native";
-import { StyleSelector } from "../components/StyleSelector";
+import { CategorySelector } from "../components/CategorySelector";
 import { LoadingAnimation } from "../components/LoadingAnimation";
 import { useRecentStickers } from "../context/RecentStickersContext";
-import { generateSticker, detectAndCropFace, hasReplicateToken } from "../services/replicateApi";
-import type { StickerStyle } from "../services/replicateApi";
-import { saveStickerLocally } from "../utils/saveStickerLocally";
+import {
+  generateImageFromPrompt,
+  generateStickerFromPhoto,
+  hasReplicateToken,
+  removeBackground,
+} from "../services/replicateApi";
 import { prepareImageForReplicate } from "../utils/imagePrep";
+import { generateStickerWithGrok, hasGrokApiKey } from "../services/grokApi";
+import { saveStickerLocally } from "../utils/saveStickerLocally";
+import { resizeToStickerSize } from "../utils/stickerFormatter";
+import * as Haptics from "expo-haptics";
 import type { RootStackParamList } from "../types/navigation";
 
 type GeneratorNav = NativeStackNavigationProp<RootStackParamList, "Generator">;
@@ -19,14 +26,19 @@ type GeneratorNav = NativeStackNavigationProp<RootStackParamList, "Generator">;
 function GeneratorScreenInner() {
   const navigation = useNavigation<GeneratorNav>();
   const { addSticker } = useRecentStickers();
+  const [prompt, setPrompt] = useState("");
   const [photoUri, setPhotoUri] = useState<string | null>(null);
-  const [style, setStyle] = useState<StickerStyle | null>(null);
+  const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const useReplicate = hasReplicateToken();
+  const useGrok = hasGrokApiKey();
+  const canGenerate =
+    !!prompt.trim() && (useReplicate || (useGrok && !!photoUri));
 
   const requestPermissions = async () => {
     const { status } = await ImagePicker.requestCameraPermissionsAsync();
     if (status !== "granted") {
-      Alert.alert("Camera access is needed to take a selfie.");
+      Alert.alert("Camera access is needed to take a photo.");
       return false;
     }
     return true;
@@ -53,59 +65,133 @@ function GeneratorScreenInner() {
   };
 
   const handleGenerate = async () => {
-    if (!photoUri || !style) {
-      Alert.alert("Pick a photo and a style first.");
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      Alert.alert("Describe your sticker", "e.g. a cute cat in a hat, anime dragon, funny avocado");
       return;
     }
-    if (!hasReplicateToken()) {
+    if (!canGenerate) {
       Alert.alert(
-        "API key missing",
-        "Add EXPO_PUBLIC_REPLICATE_API_TOKEN to the .env file in the funmoji folder, then fully restart the dev server (stop and run npx expo start again)."
+        "API key needed",
+        "Add EXPO_PUBLIC_REPLICATE_API_TOKEN to your .env to generate stickers from prompts. Get a key at replicate.com."
       );
       return;
     }
-    setLoading(true);
-    try {
-      const preparedUri = await prepareImageForReplicate(photoUri);
-      const faceImageUrl = await detectAndCropFace(preparedUri);
-      const imageForSticker = faceImageUrl ?? preparedUri;
-      const resultUrl = await generateSticker(imageForSticker, style);
-      const localUri = await saveStickerLocally(resultUrl);
-      await addSticker(localUri);
-      setLoading(false);
-      navigation.replace("Preview", { imageUri: localUri });
-    } catch (e) {
-      setLoading(false);
-      const msg = e instanceof Error ? e.message : String(e);
-      const friendly =
-        msg.includes("REPLICATE_API_TOKEN") || msg.includes("Missing")
-          ? "Replicate API key not set. Add EXPO_PUBLIC_REPLICATE_API_TOKEN to your .env and restart the dev server."
-          : msg.includes("fetch") || msg.includes("Network") || msg.includes("Failed to fetch")
-            ? "Network error. Check your connection and try again."
-            : msg.includes("401") || msg.includes("403")
-              ? "Invalid Replicate API key. Check your token at replicate.com/account/api-tokens"
-              : msg;
-      Alert.alert("Couldn’t create sticker", friendly);
+    if (photoUri) {
+      setLoading(true);
+      try {
+        // One sticker per photo: remove background (crop to subject, no background) then AI + prompt
+        let imageForSticker: string;
+        if (useReplicate) {
+          const prepared = await prepareImageForReplicate(photoUri);
+          try {
+            imageForSticker = await removeBackground(prepared);
+          } catch {
+            imageForSticker = prepared;
+          }
+        } else {
+          imageForSticker = await prepareImageForReplicate(photoUri);
+        }
+        const resultUrl =
+          useGrok
+            ? await generateStickerWithGrok(imageForSticker, trimmed)
+            : await generateStickerFromPhoto(imageForSticker, trimmed);
+        const downloaded = await saveStickerLocally(resultUrl);
+        const localUri = await resizeToStickerSize(downloaded);
+        await addSticker(localUri);
+        setLoading(false);
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        navigation.replace("Preview", { imageUri: localUri });
+      } catch (e) {
+        setLoading(false);
+        const msg = e instanceof Error ? e.message : String(e);
+        Alert.alert("Couldn't create sticker", msg);
+      }
+      return;
     }
+    if (useReplicate) {
+      setLoading(true);
+      try {
+        const resultUrl = await generateImageFromPrompt(trimmed);
+        const downloaded = await saveStickerLocally(resultUrl);
+        const localUri = await resizeToStickerSize(downloaded);
+        await addSticker(localUri);
+        setLoading(false);
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        navigation.replace("Preview", { imageUri: localUri });
+      } catch (e) {
+        setLoading(false);
+        const msg = e instanceof Error ? e.message : String(e);
+        Alert.alert("Couldn't create sticker", msg);
+      }
+      return;
+    }
+    Alert.alert(
+      "API key needed",
+      "Add EXPO_PUBLIC_REPLICATE_API_TOKEN to your .env to generate stickers from prompts."
+    );
   };
 
   if (loading) {
     return (
       <View className="flex-1 bg-brand-dark">
-        <LoadingAnimation message="Creating your sticker…" />
+        <LoadingAnimation
+          message={
+            photoUri
+              ? useReplicate
+                ? "Removing background, then creating sticker…"
+                : useGrok
+                  ? "Creating sticker with Grok…"
+                  : "Creating your sticker…"
+              : "Creating your sticker…"
+          }
+        />
       </View>
     );
   }
 
   return (
     <SafeAreaView className="flex-1 bg-brand-dark" edges={["top"]}>
-      <View className="flex-1 px-6 pt-4 pb-8">
+      <ScrollView
+        className="flex-1"
+        contentContainerStyle={{ paddingHorizontal: 24, paddingTop: 16, paddingBottom: 40 }}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+      >
         <Text className="text-xl font-bold text-white mb-1">New Sticker</Text>
         <Text className="text-brand-neon/80 text-sm mb-6">
-          Add a selfie and choose a style
+          Describe your sticker. Add a photo to turn it into that style, or generate from text only.
         </Text>
 
-        <View className="flex-row gap-4 mb-6">
+        <Text className="text-brand-neon/90 font-semibold mb-3">Describe your sticker</Text>
+        <TextInput
+          value={prompt}
+          onChangeText={(text) => {
+            setPrompt(text);
+            setSelectedCategoryId(null);
+          }}
+          placeholder="e.g. a cute cat in a wizard hat, anime style dragon, funny avocado with sunglasses"
+          placeholderTextColor="#a78bfa80"
+          className="bg-brand-purple/50 border-2 border-brand-accent/50 rounded-2xl px-4 py-3 text-white text-base min-h-[52px]"
+          multiline
+          maxLength={500}
+        />
+        <Text className="text-brand-neon/60 text-xs mt-2 mb-3">Categories – tap to fill prompt</Text>
+        <CategorySelector
+          selectedCategoryId={selectedCategoryId}
+          onSelectCategory={(promptText, categoryId) => {
+            setPrompt(promptText);
+            setSelectedCategoryId(categoryId);
+          }}
+        />
+
+        <Text className="text-brand-neon/90 font-semibold mb-3 mt-6">
+          Add photo (optional)
+        </Text>
+        <Text className="text-brand-neon/60 text-xs mb-3">
+          We'll remove the background, then turn it into one sticker using your prompt above
+        </Text>
+        <View className="flex-row gap-4 mb-4">
           <Pressable
             onPress={takePhoto}
             className="flex-1 rounded-2xl border-2 border-brand-accent/50 py-4 items-center"
@@ -123,47 +209,49 @@ function GeneratorScreenInner() {
             <Text className="text-brand-neon mt-2 font-medium">Library</Text>
           </Pressable>
         </View>
-
         {photoUri ? (
-          <View className="rounded-2xl overflow-hidden border-2 border-brand-neon mb-6 bg-brand-purple/50">
+          <View className="rounded-2xl overflow-hidden border-2 border-brand-neon bg-brand-purple/50 mb-6">
             <Image
               source={{ uri: photoUri }}
               className="w-full rounded-2xl"
-              style={{ aspectRatio: 1, maxHeight: 220 }}
+              style={{ aspectRatio: 1, maxHeight: 180 }}
               resizeMode="cover"
             />
           </View>
         ) : (
           <View
-            className="rounded-2xl border-2 border-dashed border-brand-accent/40 py-12 mb-6 items-center"
+            className="rounded-2xl border-2 border-dashed border-brand-accent/40 py-8 mb-6 items-center"
             style={{ backgroundColor: "rgba(26,10,46,0.5)" }}
           >
-            <ImagePlus size={48} color="#6b21a8" />
-            <Text className="text-brand-neon/60 mt-2">No photo selected</Text>
+            <Text className="text-brand-neon/60">No photo – we'll generate from prompt only</Text>
           </View>
         )}
 
-        <Text className="text-brand-neon/90 font-semibold mb-3">Style</Text>
-        <StyleSelector selected={style} onSelect={setStyle} />
-
         <Pressable
           onPress={handleGenerate}
-          disabled={!photoUri || !style}
-          className="mt-8 rounded-2xl overflow-hidden"
+          disabled={!prompt.trim() || !canGenerate}
+          className="mt-6 rounded-2xl overflow-hidden"
           style={({ pressed }) => ({ opacity: pressed ? 0.9 : 1 })}
         >
           <View
             className="py-4 rounded-2xl flex-row items-center justify-center gap-2"
             style={{
-              backgroundColor: photoUri && style ? "#a855f7" : "#4c1d95",
-              opacity: photoUri && style ? 1 : 0.6,
+              backgroundColor: prompt.trim() && canGenerate ? "#a855f7" : "#4c1d95",
+              opacity: prompt.trim() && canGenerate ? 1 : 0.6,
             }}
           >
             <Sparkles size={22} color="#fff" />
-            <Text className="text-lg font-bold text-white">Generate</Text>
+            <Text className="text-lg font-bold text-white">Generate Sticker</Text>
           </View>
         </Pressable>
-      </View>
+
+        {!canGenerate ? (
+          <Text className="text-brand-neon/60 text-sm text-center mt-4">
+            Add EXPO_PUBLIC_REPLICATE_API_TOKEN to .env to generate from prompts (get key at
+            replicate.com)
+          </Text>
+        ) : null}
+      </ScrollView>
     </SafeAreaView>
   );
 }
